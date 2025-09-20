@@ -65,4 +65,3 @@ python cnn_detector.py --model eye_model.pth
 - Webcam with macOS camera permission granted
 - ~1.1 GB disk for DeepFace models (downloaded on first run)
 
-
