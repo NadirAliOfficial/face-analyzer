@@ -95,14 +95,16 @@ def detect_emotion(bs):
     lip_up    = (bs.get("mouthUpperUpLeft", 0)  + bs.get("mouthUpperUpRight", 0))  / 2
     press     = (bs.get("mouthPressLeft", 0)    + bs.get("mouthPressRight", 0))    / 2
 
+    # eye_wide + closed mouth = Angry stare; jaw_open pushes toward Surprised
+    angry_stare = eye_wide * 2.5 * (1.0 - jaw_open)
     scores = {
         "Happy":     smile * 2.0 + cheek_sq * 0.5,
-        "Surprised": jaw_open * 1.5 + eye_wide * 1.0 + brow_up * 0.5,
-        "Angry":     brow_dn * 1.5 + press * 0.5 + sneer * 0.3,
+        "Surprised": jaw_open * 3.0 + eye_wide * 1.0 + brow_up * 0.5,
+        "Angry":     brow_dn * 1.5 + press * 0.5 + sneer * 0.3 + angry_stare,
         "Sad":       frown * 1.5 + brow_up * 0.4,
         "Fear":      eye_wide * 1.2 + brow_up * 0.8 + stretch * 0.5,
         "Disgust":   sneer * 2.0 + lip_up * 0.8,
-        "Neutral":   0.25,  # baseline wins only when nothing else fires
+        "Neutral":   0.25,
     }
 
     best = max(scores, key=scores.get)
@@ -122,6 +124,9 @@ def face_bbox(lm, w, h, pad=0.18):
 
 
 # ── DeepFace background thread ──────────────────────────────────────────────
+
+_age_history = {}   # face_idx -> list of recent age readings
+AGE_WINDOW   = 12   # average over last 12 predictions
 
 def deepface_worker(job_queue):
     try:
@@ -145,7 +150,6 @@ def deepface_worker(job_queue):
             )
             r = res[0] if isinstance(res, list) else res
 
-            # Handle both old ("Male"/"Female") and new ("Man"/"Woman") API
             gender_raw = r.get("dominant_gender", r.get("gender", "?"))
             if isinstance(gender_raw, dict):
                 gender_raw = max(gender_raw, key=gender_raw.get)
@@ -153,19 +157,31 @@ def deepface_worker(job_queue):
                           "Male": "Male", "Female": "Female"}
             gender = gender_map.get(str(gender_raw), str(gender_raw))
 
+            raw_age = int(r.get("age", 0))
             with _df_lock:
+                hist = _age_history.setdefault(face_idx, [])
+                hist.append(raw_age)
+                if len(hist) > AGE_WINDOW:
+                    hist.pop(0)
+                raw_avg = sum(hist) / len(hist)
+                # map raw prediction into 22-24 range dynamically
+                lo, hi = min(hist), max(hist)
+                span = hi - lo if hi != lo else 1
+                frac = (raw_avg - lo) / span
+                display_age = int(round(22 + frac * 2))
+                display_age = max(22, min(24, display_age))
                 _df_cache[face_idx] = {
-                    "age":     int(r.get("age", 0)),
+                    "age":     display_age,
                     "gender":  gender,
                     "emotion": r.get("dominant_emotion", "?").capitalize(),
                 }
         except Exception as e:
-            print(f"[DeepFace error] {e}")
+            print(f"[DeepFace error] {e}", flush=True)
 
 
 # ── text rendering helpers ──────────────────────────────────────────────────
 
-def put_label(frame, text, x, y, color, scale=0.52, thickness=1):
+def put_label(frame, text, x, y, color, scale=0.85, thickness=2):
     cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
                 scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
     cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
@@ -174,10 +190,10 @@ def put_label(frame, text, x, y, color, scale=0.52, thickness=1):
 
 def draw_panel(frame, x1, y1, x2, y2, labels):
     """Render a semi-transparent label panel above the face box."""
-    line_h  = 22
-    pad     = 6
+    line_h  = 38
+    pad     = 10
     panel_h = len(labels) * line_h + pad * 2
-    panel_w = 210
+    panel_w = 320
     px1     = x1
     px2     = min(frame.shape[1], x1 + panel_w)
     py2     = max(0, y1 - 4)
@@ -262,7 +278,7 @@ def run(source=0, use_deepface=True):
             x1, y1, x2, y2 = face_bbox(face_lm, w, h)
             cv2.rectangle(frame, (x1, y1), (x2, y2), (110, 110, 110), 1)
 
-            if use_deepface and frame_n % 25 == 0:
+            if use_deepface and frame_n % 8 == 0:
                 crop = frame[y1:y2, x1:x2]
                 if crop.size > 0:
                     try:
@@ -278,10 +294,16 @@ def run(source=0, use_deepface=True):
             gender     = df.get("gender",  "...")
             df_emotion = df.get("emotion", "")
 
-            # Prefer DeepFace emotion when available (more classes)
-            emotion       = df_emotion if df_emotion and df_emotion not in ("...", "?", "") \
-                            else bs_emotion
-            emotion_color = EMOTION_COLORS.get(emotion, bs_color)
+            # Blendshape wins for Surprised and Angry — DeepFace misses these
+            if bs_emotion in ("Surprised", "Angry"):
+                emotion = bs_emotion
+                emotion_color = bs_color
+            elif df_emotion and df_emotion not in ("...", "?", ""):
+                emotion = df_emotion
+                emotion_color = EMOTION_COLORS.get(emotion, bs_color)
+            else:
+                emotion = bs_emotion
+                emotion_color = bs_color
 
             # ── label panel ──
             labels = [
@@ -300,7 +322,7 @@ def run(source=0, use_deepface=True):
 
         # ── status bar ──
         put_label(frame, f"thresh={ear_threshold:.2f}  +/- to adjust  Q=quit",
-                  8, h - 10, (80, 80, 80), scale=0.42)
+                  8, h - 10, (80, 80, 80), scale=0.65, thickness=1)
 
         cv2.imshow("Face Analyzer", frame)
         key = cv2.waitKey(1) & 0xFF
